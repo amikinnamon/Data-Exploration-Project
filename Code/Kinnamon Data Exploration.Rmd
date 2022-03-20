@@ -1,0 +1,316 @@
+---
+title: "Data Exploration Project"
+author: "Ami Kinnamon"
+date: "3/19/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+message = FALSE
+warning = FALSE
+```
+
+## Introduction
+### Purpose 
+This project compiles together multiple data files, cleans and manipulates them, builds regression designs, and analyzes the findings to answer a research question. 
+
+### Research Question
+Among colleges that predominantly grant Bachelor’s degrees, did the release of the College Scorecard in September 2015 shift student interest to high-earnings colleges relative to low-earnings ones?
+
+### Background on the Data 
+This project compiles three different sets of data. The first set of data comes from **Google Trends**, which indicates the number of searches for certain keywords for specific college institutions for a given week for a three-year time period between March 2013 to March 2016. The number of Google searches about a particular institution is indicated by the Google Trends index. This measurement will act as the basis of student interest that we am exploring. 
+
+The second set of data comes from **the College Scorecard**, which is an online tool created by the U.S. Department of Education. The scorecard is released annually with updated information on institution size, student demographics, standardized test scores, graduates’ earning levels, and other differing characteristics like whether or not the institution is religiously affiliated. This tool is meant to provide insight on various college institutions to prospective students and aid with their enrollment decisions. 
+
+The third set of data includes different unique identifiers for institutions that can be used to properly match the institutions in the Google Trends and the College Scorecard data sets.
+
+
+## Loading the Libraries
+```{r results = FALSE, message=FALSE, warning=FALSE}
+library(car)
+library(fixest)
+library(haven)
+library(jtools)
+library(lubridate)
+library(purrr)
+library(readr) 
+library(tidyverse)
+library(vtable)
+```
+
+<br>
+
+## Loading the Data
+* "scores" data frame captures the College Scorecard that was released in September 2015.
+* "trends" data frame captures the Google Trends data from March 2013 to March 2016. 
+* "id_name" data frame captures unique identifiers for each college institution. 
+
+```{r results = FALSE, message=FALSE, warning=FALSE}
+list_trends <- list.files(pattern = "trends_up_to")
+trends <- list_trends %>%
+  map_dfr(read_csv) 
+
+id_name <- read_csv("id_name_link.csv")
+scores <- read_csv("Most+Recent+Cohorts+(Scorecard+Elements).csv")
+```
+ 
+<br>
+
+## Cleaning & Preparing the Data
+### Google Trends Data
+**Checking for and Omitting NULL values**
+```{r message=FALSE, warning=FALSE}
+# Comparing the number of observations before and after the na.omit function to determine if any observations had to be dropped. 
+checkTrends <- na.omit(trends)
+nrow(trends)
+nrow(checkTrends)
+trends <- checkTrends
+```
+
+**Standardizing the Google Trends indices based on school per keyword per month** <br>
+The raw data for Google Trends provides a weekly summary of Google searches made for each school for specific keywords. Because of the nature of the data, which only allows the Google Trends indices to be compared internally specific to each school, the indices had to be standardized by comparing the individual observations to the mean for the school for a specific keyword. 
+
+The indices were standardized by month instead of the week in order to study how seasonality may be associated with Google searches. This intuition derived from how more searches are likely to occur when it is college application season like fall compared to other seasons. 
+
+```{r results=FALSE, message=FALSE, warning=FALSE}
+new_trends <- trends %>%
+  mutate(year_month = str_sub(monthorweek, 1, 7)) %>%
+  select(schname, keyword, year_month, index) %>%
+  group_by(schname, keyword, year_month)%>%
+  summarise(monthly_sum = sum(index)) 
+
+new_trends <- new_trends %>%
+  group_by(schname, keyword) %>%
+  mutate(index_std = (monthly_sum - mean(monthly_sum,na.rm = TRUE))/sd(monthly_sum, na.rm = TRUE))
+```
+
+**Creating a binary variable for Release of Scorecard** <br>
+In order to study if there are any changes in the Google Trends indices after the release of the College Scorecard, the code below was used to create a binary variable to indicate whether the monthly observation reported in the Google Trends data was before or after its release in September 2015. In a new column named "after_2015", observations September 2015 and before were marked with a "0" and any months from October 2015 and forward were marked with a "1." 
+
+```{r}
+new_trends <- new_trends %>%
+  mutate(year_month = ym(year_month)) %>%
+  mutate(after_2015 = year_month > ym('2015-09')) %>%
+  mutate(month = month(year_month)) 
+
+new_trends$month <- as.factor(new_trends$month)
+```
+
+
+### ID Name Data
+**Checking for and Omitting NULL values**
+```{r message=FALSE, warning=FALSE}
+# Comparing the number of observations before and after the na.omit function to determine if any observations had to be dropped.
+checkID <- na.omit(id_name)
+nrow(id_name)
+nrow(checkID)
+# There were no observations with NULLs. 
+```
+
+**Removing duplicate university names**
+```{r}
+id_name_1 <- id_name %>%
+  group_by(schname) %>%
+  mutate(n = n()) %>%
+  filter(n == 1)
+```
+
+**Renaming columns for consistency among data frames** 
+```{r}
+id_name <- rename(id_name, OPEID = opeid)
+id_name <- rename(id_name, UNITID = unitid)
+```
+
+
+### Scorecard Data 
+**Checking for and Omitting NULL values**
+```{r warning = FALSE, message=FALSE}
+# Comparing the number of observations before and after the na.omit function to determine if any observations had to be dropped.
+checkScores <- na.omit(scores)
+nrow(scores)
+nrow(checkScores)
+# There were no observations with NULLs. 
+```
+
+**Selecting variables to explore in regression**
+```{r}
+new_scores <- scores %>%
+  select(UNITID, OPEID, PREDDEG, STABBR, LOCALE,
+         CONTROL, HBCU, "md_earn_wne_p10-REPORTED-EARNINGS") %>%
+  mutate(CITY_SIZE = LOCALE < 14) 
+# The mutate code above created a new binary variable that indicates whether or not a college was in a city.
+  
+new_scores <- rename(scores, MED_EARNINGS = "md_earn_wne_p10-REPORTED-EARNINGS")
+```
+
+**Filtering and correcting the data type for MED_EARNINGS**
+```{r warning=FALSE, message=FALSE, results=FALSE}
+new_scores <- new_scores %>%
+  filter(MED_EARNINGS != "PrivacySuppressed" & MED_EARNINGS != "NULL")
+
+class(new_scores$MED_EARNINGS)
+new_scores$MED_EARNINGS <- as.numeric(new_scores$MED_EARNINGS)
+class(new_scores$MED_EARNINGS)
+```
+
+**Filtering the College Scorecard data for Predominantly Bachelor's schools alone** <br>
+Stripping the data of all other types of institutions is necessary to directly answer the research question. 
+```{r}
+new_scores <- new_scores %>%
+  filter(PREDDEG == 3)
+```
+
+**Creating a binary variable to distinguish "high earning" and "low earning" institutions** <br>
+The research question specifically asks for the effect of the shift between low earning and high earning institutions. This binary information is not provided in the original data. Thus a new binary variable must be created with a certain cutoff that marks what is considered high or low earning. 
+
+*Exploring the MED_EARNINGS distribution* <br>
+In order to determine the cutoff point, I first looked at the distribution of reported earnings for Bachelor's degree holders 10 years after graduation. The distribution is positively skewed with a tail on the right end. This illustrates how majority of the observations included in the Scorecard data clusters around $40,000.
+```{r message=FALSE, warning=FALSE}
+median(new_scores$MED_EARNINGS)
+mean(new_scores$MED_EARNINGS)
+
+earn_dist <- ggplot(new_scores, aes(x=MED_EARNINGS)) + 
+  geom_density()
+
+earn_dist + 
+  geom_vline(aes(xintercept=mean(MED_EARNINGS)), color="blue", linetype="dashed", size=1) +
+  theme(panel.background = element_blank(),
+        plot.title = element_text(hjust = 0, size=12, face="bold")) +
+  labs(title = "Distribution of Median Earnings of College Graduates",
+       subtitle = "10 years after obtaining a Bachelor's degree",
+       x = "Median Earnings ($)",
+       caption = "*Dashed line represents the mean",
+       y = "Density")
+```
+
+*Researching the median earnings for Bachelor's degree holders in 2015* <br>
+Next, I looked into an outside source.According to a [figure](https://skloff.com/median-earnings-by-education-college-board-2015/) published by the U.S. Census Bureau called “Median Earnings and Tax Payments of Full-Time Year-Round Workers Age 25 and Older, by Education Level, 2015”, those with Bachelor’s Degrees had a median income of $61,400 in 2015. 
+
+The mean and the median of the Scorecard data differ from the median earnings reported by the U.S. Census Bureau by nearly $20,000. This discrepancy may be the result of how the Scorecard may have a less representative and comprehensive data source in comparison to the Census data. It also could simply be that there were more observations in the Scorecard data from colleges with lower earning graduates than colleges with higher earning graduates. 
+
+While it is possible to use the Scorecard mean or median as the cutoff for the binary variable to distinguish between low and high earning colleges, the skewed Scorecard data distribution would not allow for a fair comparison between schools. For instance, median earnings of \$50,000 a year for a certain institution relative to the skewed distribution would make this college look like it is high earning even though that school would still be far below the median earnings reported by the Census. For the purposes of answering the research question and creating a binary variable that distinguishes between low earning and high earning colleges with less bias from the skewed data, the cutoff value of **\$61,400** will be derived from the Census data.
+
+```{r results=FALSE, warning=FALSE, message=FALSE}
+new_scores <- new_scores %>%
+  mutate(high_earning = MED_EARNINGS > 61400)
+```
+
+
+### Joining the three cleaned data frames together 
+```{r results=FALSE, warning=FALSE, message=FALSE}
+join1 <- left_join(id_name, new_scores, by = c("UNITID","OPEID"))
+join2 <- inner_join(join1, new_trends, by = "schname")
+
+# Omitting the NULLS for the joined data frames
+checkJoin2 <- na.omit(join2)
+nrow(join2)
+nrow(checkJoin2)
+
+# The final cleaned data frame that will be used for the regression is named "data". 
+data <- checkJoin2
+```
+
+## Regression Models 
+### Regression #1 
+The first regression considered was a simple regression on the standardized Google Trends index with an interaction between two binary variables: one indicating whether or not an observation occurred after the release of the Scorecard, and another indicating whether or not the the college was high earning. 
+
+Because of the nature of the research question which asks about a shift in the Google searches from low to high earnings given that it is after the Scorecard release, it is vital to include this interaction term. 
+
+Robust standard errors were used in case there is heteroscedasticity, which would violate an important assumption of homoscedasticity for linear regression. 
+
+```{r}
+reg1 <- lm(index_std ~ after_2015 * high_earning, data = data)
+export_summs(reg1, robust=TRUE)
+```
+
+#### Interpretation
+
+The coefficient of our interest in answering the research question is for the term “after_2015TRUE:high_earningTRUE”. The coefficient here is **0.04**, which means that given that it is after the release of the Scorecard, there was an associated shift of 0.04 standard deviations in Google searches from low-earning to high-earning institutions. While this does show some shift, the p-value is not small enough. This means that there is not strong enough evidence to support that there was a significant shift. 
+
+
+### Considering Controls 
+Using the first regression model as the baseline, there were a few controls considered adjusting for in our models. 
+
+**Month** <br>
+Month was considered in hopes of capturing different levels of searches in accordance to the timeline for college applications. The intuition behind including **month** was the idea that months leading up to major college application deadlines from November to January are likely to have more searches than other months. 
+
+I explored this intuition by plotting the average standardized Google searches each month.
+
+```{r}
+data4 <- data %>%
+  group_by(year_month) %>%
+  summarise(monthly_index = mean(index_std), na.rm=TRUE) 
+
+s <- ggplot(data=data4, aes(x=year_month, y=monthly_index)) +
+  geom_line()
+s + scale_x_date(breaks = scales::breaks_pretty(12)) +
+  theme(panel.background = element_blank(),
+        plot.title = element_text(hjust = 0, size=12, face="bold"),
+        axis.title.x = element_blank()) +
+  labs(title = "Google Searches (Standardized) About Colleges Over Time",
+       y = "Google Searches Standard Deviations")
+```
+<br>
+This revealed some months consistently show upward or downward trends over the years. For instance, every July shows an average that is below 0, while March and September consistently show an upward trend higher than 0. This suggests that seasonality have some relationship with Google searches. 
+
+
+**CITY_SIZE** <br>
+City was considered with the intuition that institutions in cities in comparison to rural areas are more likely to be popular and well-known, therefore those institutions are likely to generate more searches in general, regardless of the Scorecard. 
+
+I explored this intuition by plotting the average standardized Google searches each month for schools in cities and schools located elsewhere (smaller areas like rural and suburban areas).
+
+```{r}
+data5 <- data %>%
+  mutate(CITY_SIZE = LOCALE < 14) %>%
+  group_by(CITY_SIZE, year_month) %>%
+  summarise(monthly_index = mean(index_std), na.rm=TRUE) 
+
+r <- ggplot(data=data5, aes(x=year_month, y=monthly_index, color=CITY_SIZE)) +
+  geom_line()
+r + scale_x_date(breaks = scales::breaks_pretty(10)) +
+  theme(panel.background = element_blank(),
+        plot.title = element_text(hjust = 0, size=12, face="bold"),
+        axis.title.x = element_blank()) +
+  labs(title = "Google Searches (Standardized) About Colleges Over Time",
+       subtitle = "Comparing Colleges in Cities vs. Smaller Areas",
+       y = "Google Searches Standard Deviations") + 
+  scale_color_discrete(name ="Located in a City")
+```
+<br>
+The graph illustrates that the monthly Google searches follow very similar trends between schools located in a city in comparison to schools located in smaller areas. The intuition I had may not be as relevant based on this visualization, however, I still chose to run a regression anyway to confirm. 
+
+```{r echo=FALSE, results=FALSE, message=FALSE}
+data <- data %>%
+  mutate(CITY_SIZE = LOCALE < 14)
+```
+
+### Regressions #2 & #3
+```{r}
+# Interaction term & 'month' added as fixed effects
+reg2 <- feols(index_std ~ after_2015 * high_earning | month, data = data)
+
+# Interaction term & 'CITY_SIZE'
+reg3 <- lm(index_std ~ after_2015 * high_earning + CITY_SIZE, data = data)
+
+export_summs(reg1, reg2, reg3, robust=TRUE,
+             model.names = c("Interaction Only","With Month", "With City Size"))
+```
+
+#### Interpretation
+
+The two new regressions yielded the same coefficient for the shift as the original model with only the interaction term between the Scorecard release and whether or not the school is high-earning. The controls were not as associated with the Google searches as I had believed. Accounting for differences across the months or whether or not the school is located in a city, after the release of the Scorecard, there was an associated shift of 0.04 standard deviations in Google searches from low-earning to high-earning institutions. Again, the p-value is too high to provide sufficient evidence on this shift.  
+
+
+## Linear Hypothesis Test
+```{r}
+linearHypothesis(reg1, 'after_2015TRUE + after_2015TRUE:high_earningTRUE = 0')
+```
+The linear hypothesis test above tests the null hypothesis that the coefficient for the interaction term variable is 0. If the p-value was larger than 0.05, this means we would fail to reject the null hypothesis that the interaction has no predictive power in the linear model. However, in this case, the p-value is smaller than 0.05, which indicates that there is strong evidence to reject the null hypothesis. This suggests that there is indeed some non-zero effect by the interaction, meaning there is indeed a shift from low-earning to high-earning schools after the release of the Scorecard. However, this knowledge combined with my previous analyses reveal that the shift may exist but it is incredibly small and not very relevant. 
+
+
+## Conclusion
+The analyses suggest that the release of the Scorecard did impact the Google searches, showing a shift in searches from low-earning schools to high-earning schools. This *could* mean that prospective students showed more interest in high-earning schools after new information from the Scorecard was published. However, the impact is very small, and the model does not produce significant evidence for this claim. 
+
+I think it would be interesting to look into this data more with other research questions. For instance, it may be possible to capture the changing interest of prospective schools after the release of the Scorecard by looking at the number of hits on the Scorecard data itself. Do some schools get more or less hits on their Scorecard pages after the release of new information? When do users access the Scorecard the most during a given year? 
+
